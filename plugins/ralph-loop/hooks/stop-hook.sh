@@ -3,6 +3,9 @@
 # Ralph Loop Stop Hook
 # Prevents session exit when a ralph-loop is active
 # Feeds Claude's output back as input to continue the loop
+#
+# Cross-platform: Works on Linux, macOS, and Windows (via Git Bash/MSYS)
+# No external dependencies (jq, perl replaced with native tools)
 
 set -euo pipefail
 
@@ -54,8 +57,16 @@ if [[ $MAX_ITERATIONS -gt 0 ]] && [[ $ITERATION -ge $MAX_ITERATIONS ]]; then
   exit 0
 fi
 
-# Get transcript path from hook input
-TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | jq -r '.transcript_path')
+# Get transcript path from hook input (replace jq with grep/sed)
+TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | grep -oE '"transcript_path"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"[^"]*"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+
+if [[ -z "$TRANSCRIPT_PATH" ]]; then
+  echo "⚠️  Ralph loop: No transcript path provided" >&2
+  echo "   This is unusual and may indicate a Claude Code internal issue." >&2
+  echo "   Ralph loop is stopping." >&2
+  rm "$RALPH_STATE_FILE"
+  exit 0
+fi
 
 if [[ ! -f "$TRANSCRIPT_PATH" ]]; then
   echo "⚠️  Ralph loop: Transcript file not found" >&2
@@ -86,22 +97,22 @@ if [[ -z "$LAST_LINE" ]]; then
   exit 0
 fi
 
-# Parse JSON with error handling
-LAST_OUTPUT=$(echo "$LAST_LINE" | jq -r '
-  .message.content |
-  map(select(.type == "text")) |
-  map(.text) |
-  join("\n")
-' 2>&1)
+# Extract text content from JSON (replace jq with sed/awk)
+# Extract the content array and get text from text blocks
+LAST_OUTPUT=$(echo "$LAST_LINE" | sed -n 's/.*"content":\[\(.*\)\].*/\1/p' | \
+  sed 's/{"type":"text","text":"\\n"/\\n/g' | \
+  sed 's/},{"type":"text","text":"/\\n/g' | \
+  sed 's/\\"/"/g' | \
+  sed 's/\\n/\n/g' | \
+  sed 's/^"//;s/"$//' || echo "")
 
-# Check if jq succeeded
-if [[ $? -ne 0 ]]; then
-  echo "⚠️  Ralph loop: Failed to parse assistant message JSON" >&2
-  echo "   Error: $LAST_OUTPUT" >&2
-  echo "   This may indicate a transcript format issue" >&2
-  echo "   Ralph loop is stopping." >&2
-  rm "$RALPH_STATE_FILE"
-  exit 0
+# Additional fallback: try extracting text fields directly
+if [[ -z "$LAST_OUTPUT" ]]; then
+  LAST_OUTPUT=$(echo "$LAST_LINE" | grep -o '"text":"[^"]*"' | \
+    sed 's/"text":"//g' | \
+    sed 's/"$//g' | \
+    sed 's/\\n/\n/g' | \
+    sed 's/\\"/"/g' || echo "")
 fi
 
 if [[ -z "$LAST_OUTPUT" ]]; then
@@ -111,16 +122,14 @@ if [[ -z "$LAST_OUTPUT" ]]; then
   exit 0
 fi
 
-# Check for completion promise (only if set)
+# Check for completion promise (only if set) - replace perl with sed
 if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
-  # Extract text from <promise> tags using Perl for multiline support
-  # -0777 slurps entire input, s flag makes . match newlines
-  # .*? is non-greedy (takes FIRST tag), whitespace normalized
-  PROMISE_TEXT=$(echo "$LAST_OUTPUT" | perl -0777 -pe 's/.*?<promise>(.*?)<\/promise>.*/$1/s; s/^\s+|\s+$//g; s/\s+/ /g' 2>/dev/null || echo "")
+  # Extract text from <promise> tags using sed
+  # Remove newlines, extract promise, normalize whitespace
+  PROMISE_TEXT=$(echo "$LAST_OUTPUT" | tr '\n' ' ' | sed -n 's/.*<promise>\([^<]*\)<\/promise>.*/\1/p' | tr -d '[:space:]' || echo "")
 
-  # Use = for literal string comparison (not pattern matching)
-  # == in [[ ]] does glob pattern matching which breaks with *, ?, [ characters
-  if [[ -n "$PROMISE_TEXT" ]] && [[ "$PROMISE_TEXT" = "$COMPLETION_PROMISE" ]]; then
+  # Compare normalized promises (both stripped of whitespace)
+  if [[ -n "$PROMISE_TEXT" ]] && [[ "$PROMISE_TEXT" = "${COMPLETION_PROMISE// /}" ]]; then
     echo "✅ Ralph loop: Detected <promise>$COMPLETION_PROMISE</promise>"
     rm "$RALPH_STATE_FILE"
     exit 0
@@ -132,7 +141,6 @@ NEXT_ITERATION=$((ITERATION + 1))
 
 # Extract prompt (everything after the closing ---)
 # Skip first --- line, skip until second --- line, then print everything after
-# Use i>=2 instead of i==2 to handle --- in prompt content
 PROMPT_TEXT=$(awk '/^---$/{i++; next} i>=2' "$RALPH_STATE_FILE")
 
 if [[ -z "$PROMPT_TEXT" ]]; then
@@ -162,16 +170,23 @@ else
   SYSTEM_MSG="🔄 Ralph iteration $NEXT_ITERATION | No completion promise set - loop runs infinitely"
 fi
 
-# Output JSON to block the stop and feed prompt back
-# The "reason" field contains the prompt that will be sent back to Claude
-jq -n \
-  --arg prompt "$PROMPT_TEXT" \
-  --arg msg "$SYSTEM_MSG" \
-  '{
-    "decision": "block",
-    "reason": $prompt,
-    "systemMessage": $msg
-  }'
+# Output JSON to block the stop and feed prompt back (replace jq with printf)
+# Escape special characters in prompt and message
+escape_json() {
+  local s="$1"
+  # Escape backslashes first, then double quotes, then convert newlines
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+PROMPT_ESCAPED=$(escape_json "$PROMPT_TEXT")
+MSG_ESCAPED=$(escape_json "$SYSTEM_MSG")
+
+printf '{"decision":"block","reason":"%s","systemMessage":"%s"}\n' "$PROMPT_ESCAPED" "$MSG_ESCAPED"
 
 # Exit 0 for successful hook execution
 exit 0
